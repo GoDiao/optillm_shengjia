@@ -1,0 +1,374 @@
+
+from optillm.plugins.deep_research_plugin import run
+from openai import OpenAI
+import json
+import os
+from datetime import datetime
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import shutil
+import threading
+# export TAVILY_API_KEY=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
+# base_url = "http://7.242.99.245:8081/v1" from optillm.plugins.deep_research.research_engine import DeepResearcher
+# base_url = "http://100.105.89.46:8081/v1"
+base_url = "http://10.170.27.246:8088/v1"
+
+api_key = "dummy_local_key"
+
+system_prompt = (
+    "You are a research assistant. "
+    "If the initial_query is in English, generate an English report; "
+    "if it is in Chinese, generate the report in Chinese."
+)
+
+request_config = {
+    "max_iterations": 5,
+    "max_sources": 15,
+}
+
+model = "Qwen3-32B-128k-lmcache"
+prefix = './results_vllm'
+temp_result_dir = prefix+'/temp_result'
+log_dir = prefix+'/logs'
+queries_path = "./deepresearchbench/query.jsonl"
+output_path =prefix+"/output.jsonl"
+batch_run_statistics_path = prefix+'/batch_run_stats.json'
+
+num_queries = 16
+max_workers = 8
+
+
+
+# Thread-local storage for OpenAI clients
+thread_local = threading.local()
+
+def get_thread_local_client():
+    """Get or create an OpenAI client for the current thread"""
+    if not hasattr(thread_local, 'client'):
+        thread_local.client = OpenAI(base_url=base_url, api_key=api_key)
+        print(f"Created OpenAI client for thread {threading.current_thread().name}")
+    return thread_local.client
+
+
+def get_query_logger(qid):
+    """
+    Create a per-query logger that writes to its own file.
+    This prevents log interleaving in multi-threaded execution.
+    """
+    logger_name = f"Query_{qid}"
+    logger = logging.getLogger(logger_name)
+    
+    # Prevent duplicate handlers if logger already exists
+    if logger.handlers:
+        return logger
+    
+    logger.setLevel(logging.INFO)
+    
+    # Create log directory
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # File handler - one log file per query
+    log_path = os.path.join(log_dir, f"query_{qid}.log")
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    file_handler.setFormatter(formatter)
+    
+    logger.addHandler(file_handler)
+    
+    # Prevent propagation to root logger (avoid duplicate logs)
+    logger.propagate = False
+    
+    return logger
+
+
+def ensure_dir(path):
+    """Ensure directory exists"""
+    os.makedirs(path, exist_ok=True)
+
+
+def read_jsonl(file_path):
+    """Read JSONL file into list of dicts"""
+    queries = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            queries.append(json.loads(line))
+    return queries
+
+
+def write_temp_result(entry):
+    """Write a single result to temp directory"""
+    ensure_dir(temp_result_dir)
+    qid = entry.get("id", -1)
+    save_path = os.path.join(temp_result_dir, f"{qid}.json")
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(entry, f, ensure_ascii=False, indent=4)
+
+
+def clean_temp_folder():
+    """Remove temp results directory"""
+    if os.path.exists(temp_result_dir):
+        shutil.rmtree(temp_result_dir)
+
+
+def merge_temp_result():
+    """Merge all temp results into final output file"""
+    if not os.path.exists(temp_result_dir):
+        print("No temp directory found")
+        return
+    
+    metric_files = os.listdir(temp_result_dir)
+    if not metric_files:
+        print("No results to merge")
+        return
+    
+    merged_metrics = []
+    for metric_file in metric_files:
+        try:
+            with open(os.path.join(temp_result_dir, metric_file), 'r') as f:
+                entry = json.load(f)
+                merged_metrics.append(entry)
+        except Exception as e:
+            print(f"Error reading {metric_file}: {e}")
+    
+    # Sort by ID to maintain order
+    merged_metrics.sort(key=lambda x: x.get('id', 0))
+    
+    # Write to output
+    ensure_dir(os.path.dirname(output_path))
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for entry in merged_metrics:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    
+    print(f"Merged {len(merged_metrics)} results to {output_path}")
+
+
+def process_single_query(query_entry):
+    """
+    Process a single query in its own thread.
+    Each query gets its own logger to avoid log interleaving.
+    """
+    prompt = query_entry.get("prompt", "")
+    qid = query_entry.get("id", -1)
+    thread_name = threading.current_thread().name
+    
+    # Create per-query logger
+    logger = get_query_logger(qid)
+    
+    print(f"\n🔬 Query {qid}: Starting (thread: {thread_name})")
+    logger.info("="*80)
+    logger.info(f"Query {qid}: Starting deep research")
+    logger.info(f"Thread: {thread_name}")
+    logger.info(f"Prompt: {prompt}")
+    logger.info("="*80)
+    
+    start_time = time.time()
+    
+    try:
+        # Get thread-local OpenAI client
+        openai_client = get_thread_local_client()
+        
+        # Run deep research with logger
+        result, metric_report = run(
+            system_prompt=system_prompt,
+            initial_query=prompt,
+            client=openai_client,
+            model=model,
+            request_config=request_config,
+            logger=logger
+        )
+        
+        elapsed =  time.time() - start_time
+        
+        logger.info("="*80)
+        logger.info(f"Query {qid} completed successfully in {elapsed:.1f}s")
+        logger.info(f"Metrics: {metric_report}")
+        logger.info("="*80)
+        
+        entry = {
+            "id": qid,
+            "prompt": prompt,
+            "article": result,
+            "endpoint": f"{base_url}/chat/completions",
+            "model": model,
+            "thread": thread_name,
+            "elapsed_seconds": round(elapsed, 2),
+            **(metric_report if metric_report is not None else {}),
+        }
+        
+        write_temp_result(entry)
+        print(f"Query {qid}: Completed in {elapsed:.1f}s")
+        
+        # Clean up logger handlers
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+        
+        return entry
+        
+    except Exception as e:
+        elapsed = time.time() - start_time
+        
+        logger.error("="*80)
+        logger.error(f"Query {qid} failed after {elapsed:.1f}s")
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        logger.error("="*80)
+        
+        print(f"Query {qid}: Failed after {elapsed:.1f}s - {str(e)}")
+        
+        # Write error result
+        entry = {
+            "id": qid,
+            "prompt": prompt,
+            "article": f"Error: {str(e)}",
+            "endpoint": f"{base_url}/chat/completions",
+            "model": model,
+            "thread": thread_name,
+            "elapsed_seconds": round(elapsed, 2),
+            "error": str(e),
+        }
+        write_temp_result(entry)
+        
+        # Clean up logger handlers
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+        
+        # Re-raise to mark task as failed
+        raise
+
+
+def get_unprocessed_queries(queries_path, temp_result_dir):
+    """Get queries that haven't been processed yet"""
+    processed_query_ids = []
+    
+    if os.path.exists(temp_result_dir):
+        processed_query_filenames = os.listdir(temp_result_dir)
+        processed_query_ids = [
+            filename.split('.')[0] for filename in processed_query_filenames
+        ]
+
+    queries = []
+    with open(queries_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            id = str(entry["id"])
+            
+            if id not in processed_query_ids:
+                queries.append(entry)
+    
+    return queries
+
+def save_run_statistics(elapsed_time, num_workers, num_query, num_success, num_fail, start_time, end_time):
+    ensure_dir(os.path.dirname(batch_run_statistics_path))
+    
+    statistics = {
+        "elapsed_time": elapsed_time,
+        "num_workers": num_workers,
+        "num_query": num_query,
+        "successful": num_success,
+        "failed": num_fail,
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat()
+    }
+    
+    with open(batch_run_statistics_path, 'w') as f:
+        json.dump(statistics, f, indent=4)
+    
+
+def main():
+    """Main function with parallel execution and logging"""
+    
+    # Create log directory
+    ensure_dir(log_dir)
+    
+    # Setup main logger for the batch process
+    main_logger = logging.getLogger("BatchResearch")
+    main_logger.setLevel(logging.INFO)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    main_logger.addHandler(console_handler)
+    
+    main_logger.info("="*80)
+    main_logger.info("Starting Batch Deep Research (Multi-threaded)")
+    main_logger.info("="*80)
+    
+    # Clean up any previous temp results (optional - comment out to resume)
+    # clean_temp_folder()
+    
+    # Read unprocessed queries
+    queries = get_unprocessed_queries(queries_path, temp_result_dir)
+    total = min(num_queries, len(queries))
+    queries_to_process = queries[:total]
+    # queries_to_process = queries[:1]
+    
+    main_logger.info(f"Configuration:")
+    main_logger.info(f"  - Total queries to process: {total}")
+    main_logger.info(f"  - Max workers: {max_workers}")
+    main_logger.info(f"  - Max iterations per query: {request_config['max_iterations']}")
+    main_logger.info(f"  - Max sources per query: {request_config['max_sources']}")
+    main_logger.info(f"  - Model: {model}")
+    main_logger.info(f"  - Logs will be saved to: {log_dir}/")
+    main_logger.info("="*80)
+    
+    ensure_dir(temp_result_dir)
+    
+    # Process queries in parallel
+    successful = 0
+    failed = 0
+    start_time = datetime.now()
+    
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="Research") as executor:
+        # Submit all tasks
+        future_to_query = {
+            executor.submit(process_single_query, query): query 
+            for query in queries_to_process
+        }
+        
+        # Process results as they complete
+        for future in tqdm(as_completed(future_to_query), 
+                          total=len(future_to_query), 
+                          desc="Processing queries"):
+            query = future_to_query[future]
+            qid = query.get("id", -1)
+            
+            try:
+                future.result()
+                successful += 1
+            except Exception as e:
+                failed += 1
+                main_logger.error(f"Query {qid} failed: {str(e)[:200]}")
+    
+    end_time = datetime.now()
+    elapsed = (end_time - start_time).total_seconds()
+    
+    # Merge results
+    main_logger.info("="*80)
+    main_logger.info("Processing Complete")
+    main_logger.info(f"  - Total time: {elapsed:.1f}s")
+    main_logger.info(f"  - Successful: {successful}/{total}")
+    main_logger.info(f"  - Failed: {failed}/{total}")
+    main_logger.info("="*80)
+    
+    save_run_statistics(elapsed, max_workers, num_queries, successful, failed, start_time, end_time)
+    main_logger.info(f"run summary saved to {batch_run_statistics_path}")
+    
+    merge_temp_result()
+    
+    main_logger.info(f"Results saved to: {output_path}")
+    main_logger.info(f"Logs saved to: {log_dir}/")
+
+if __name__ == "__main__":
+    main()

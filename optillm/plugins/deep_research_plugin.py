@@ -106,7 +106,80 @@ class DeepResearchClientWrapper:
                     # They handle timeouts internally
                     print(f"ℹ️ Using original client (type: {self.parent.client.__class__.__name__}) without timeout modification")
                     return self.parent.client.chat.completions.create(**kwargs)
-
+def run2(system_prompt: str, 
+        initial_query: str, 
+        client, model: str, 
+        request_config: Optional[Dict] = None, 
+        logger = None,
+        session_id: Optional[str] = None
+    ) -> Tuple[str, int]:
+    """
+    Deep Research plugin implementing TTD-DR (Test-Time Diffusion Deep Researcher)
+    
+    This plugin orchestrates web search, URL fetching, and memory synthesis to provide
+    comprehensive research responses using an iterative refinement approach.
+    
+    Based on: "Deep Researcher with Test-Time Diffusion" 
+    https://arxiv.org/abs/2507.16075v1
+    
+    Args:
+        system_prompt: System prompt for the conversation
+        initial_query: User's research query
+        client: OpenAI client for LLM calls
+        model: Model name to use for synthesis
+        request_config: Optional configuration dict with keys:
+            - max_iterations: Maximum research iterations (default: 5)
+            - max_sources: Maximum web sources per search (default: 30)
+    
+    Returns:
+        Tuple of (comprehensive_research_response, total_completion_tokens)
+    """
+    # Parse configuration
+    config = request_config or {}
+    max_iterations = config.get("max_iterations", 5)  # Default to 5 iterations for faster results
+    max_sources = config.get("max_sources", 30)  # Balanced for comprehensive coverage
+    
+    # Validate inputs
+    if not initial_query.strip():
+        return "Error: No research query provided", None
+    
+    if not client:
+        return "Error: No LLM client provided for research synthesis", None
+    
+    # Create a wrapped client with extended timeout for deep research
+    # Deep research can take a long time, so we need 30 minutes timeout and no retries
+    # wrapped_client = DeepResearchClientWrapper(client, timeout=1800.0, max_retries=0)
+    wrapped_client = client
+    # Initialize researcher with wrapped client
+    researcher = DeepResearcher(
+        client=wrapped_client,
+        model=model,
+        max_iterations=max_iterations,
+        max_sources=max_sources,
+        logger=logger
+    )
+    
+    # if session_id is None:
+    #     session_id = f"research_{uuid.uuid4().hex[:8]}"
+    
+    # # Pass session_id to DeepResearcher
+    # researcher = DeepResearcher(
+    #     client=wrapped_client,
+    #     model=model,
+    #     max_iterations=max_iterations,
+    #     max_sources=max_sources,
+    #     logger=logger,
+    #     session_id=session_id  # Add this parameter
+    # )
+    
+    try:
+        # Perform deep research
+        result, metric_report = researcher.research(system_prompt, initial_query)
+        return result, metric_report
+        
+    except Exception as e:
+        error_message = f"Deep research failed: {str(e)}"
+        return error_message, None
 
 def run(system_prompt: str, initial_query: str, client, model: str, request_config: Optional[Dict] = None) -> Tuple[str, int]:
     """
